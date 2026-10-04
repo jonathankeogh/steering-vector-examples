@@ -1,0 +1,10 @@
+[project]
+name = "steering-vector"
+version = "0.1.0"
+description = "Minimal difference-in-means steering-vector playground (Gemma 2 2B-it) inspired by The Pain Axis"
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate>=1.15.0",
+    "torch>=2.14.1",
+    "transformers>=4.45",
+]
