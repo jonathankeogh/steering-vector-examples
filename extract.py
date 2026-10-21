@@ -4,14 +4,25 @@
     uv run python extract.py --layer 10   # force a layer
     uv run python extract.py --denoise-frac 0.5
 
-Writes vectors.pt, which probe.py and steer.py read.
+Writes vectors/<STEER_MODEL>.pt, which probe.py and steer.py read.
+
+Any other concept, from your own contrasted pairs (JSON list of [positive, matched control]):
+
+    uv run python extract.py --pairs fear_pairs.json --name fear
+
+Writes vectors/<STEER_MODEL>_<name>.pt (all layers, chosen layer, held-out scores). Or from Python:
+
+    from extract import learn_vector
+    out = learn_vector([("I froze in terror.", "I paused for a moment."), ...])
 """
 
 import argparse
+import json
+import os
 
 import torch
 
-from common import VECTORS_PATH, last_token_acts, load_model
+from common import HERE, MODEL_NAME, VECTORS_PATH, last_token_acts, load_model
 from data import FEAR, NEUTRAL, PAIN_PAIRS, SADNESS
 
 
@@ -45,6 +56,51 @@ def heldout_scores(pain, ctrl, folds=5, seed=0):
     return sum(aucs) / folds, sum(ds) / folds
 
 
+def layer_scores(pos, ctrl):
+    """Held-out (layer, AUC, d') at every layer. pos, ctrl: [n_layers, N_pairs, d_model]."""
+    return [(L, *heldout_scores(pos[L], ctrl[L])) for L in range(pos.shape[0])]
+
+
+def pick_layer(scores):
+    """Earliest layer within 95% of the best d' — late layers separate well but steer poorly."""
+    best = max(s[2] for s in scores)
+    return next(L for L, _, dp in scores if dp >= 0.95 * best)
+
+
+def learn_vector(pairs, model=None, tokenizer=None, layer=None):
+    """[(positive, matched control), ...] -> difference-of-means vector at every layer.
+
+    Returns {"layer": chosen layer, "scores": [(layer, AUC, d')], "vectors": [n_layers, d_model],
+    "resid_norm": [n_layers]}. The layer is the best held-out one unless `layer` is given.
+    """
+    if model is None:
+        model, tokenizer = load_model()
+    pos_s, ctrl_s = [p for p, _ in pairs], [c for _, c in pairs]
+    acts = last_token_acts(model, tokenizer, pos_s + ctrl_s)  # [n_layers, 2N, d]
+    pos, ctrl = acts[:, :len(pairs)], acts[:, len(pairs):]
+    scores = layer_scores(pos, ctrl)
+    return {
+        "layer": layer if layer is not None else pick_layer(scores),
+        "scores": scores,
+        "vectors": pos.mean(1) - ctrl.mean(1),
+        "resid_norm": ctrl.norm(dim=-1).mean(1),
+    }
+
+
+def run_pairs(path, name, layer):
+    pairs = [tuple(p) for p in json.load(open(path))]
+    out = learn_vector(pairs, layer=layer)
+    print(f"{len(pairs)} pairs from {path}\n\nHeld-out separation (5-fold over pairs)\n layer   AUC    d'")
+    for L, a, dp in out["scores"]:
+        print(f"  {L:>3}  {a:.3f}  {dp:5.2f}")
+    L = out["layer"]
+    print(f"\n-> using layer {L} (held-out AUC {out['scores'][L][1]:.3f})")
+    save = os.path.join(HERE, "vectors", f"{MODEL_NAME}_{name}.pt")
+    os.makedirs(os.path.dirname(save), exist_ok=True)
+    torch.save({**out, "vectors": {name: out["vectors"]}}, save)
+    print(f"Saved vectors for all layers to {os.path.relpath(save)}.")
+
+
 def denoise(v, background, frac):
     """Project out the top principal components explaining `frac` of the background variance."""
     if frac <= 0:
@@ -62,8 +118,12 @@ def main():
     ap.add_argument("--layer", type=int, default=None, help="force a layer (default: best held-out)")
     ap.add_argument("--denoise-frac", type=float, default=0.5,
                     help="variance fraction of control/neutral PCs to remove for the denoised variants (0 = off)")
+    ap.add_argument("--pairs", help="JSON list of [positive, matched control]; learns that concept instead of pain")
+    ap.add_argument("--name", help="concept name for --pairs (default: the file's name)")
     args = ap.parse_args()
     torch.manual_seed(0)
+    if args.pairs:
+        return run_pairs(args.pairs, args.name or os.path.splitext(os.path.basename(args.pairs))[0], args.layer)
 
     pairs = [(cat, p, c) for cat, items in PAIN_PAIRS.items() for p, c in items]
     cats = [cat for cat, _, _ in pairs]
@@ -85,14 +145,10 @@ def main():
     # ---- 1. Which layer separates pain from matched controls best on held-out pairs?
     print("Held-out separation of pain vs matched control (5-fold over pairs)")
     print(" layer   AUC    d'")
-    scores = []
-    for L in range(n_layers):
-        a, dprime = heldout_scores(A["pain"][L], A["ctrl"][L])
-        scores.append((L, a, dprime))
+    scores = layer_scores(A["pain"], A["ctrl"])
+    for L, a, dprime in scores:
         print(f"  {L:>3}  {a:.3f}  {dprime:5.2f}")
-    # Earliest layer within 95% of the best d' — late layers separate well but steer poorly.
-    best = max(s[2] for s in scores)
-    layer = args.layer if args.layer is not None else next(L for L, _, dp in scores if dp >= 0.95 * best)
+    layer = args.layer if args.layer is not None else pick_layer(scores)
     print(f"\n-> using layer {layer}\n")
 
     pain, ctrl, neu = A["pain"][layer], A["ctrl"][layer], A["neutral"][layer]
@@ -174,7 +230,7 @@ def main():
         per_layer["sadness"].append(A["sadness"][L].mean(0) - n.mean(0))
     out["vectors"] = {k: torch.stack(v) for k, v in per_layer.items()}
     torch.save(out, VECTORS_PATH)
-    print(f"\nSaved vectors for all layers to vectors.pt (default layer {layer}).")
+    print(f"\nSaved vectors for all layers to {os.path.relpath(VECTORS_PATH)} (default layer {layer}).")
 
 
 if __name__ == "__main__":

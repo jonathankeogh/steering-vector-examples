@@ -7,19 +7,47 @@ from contextlib import contextmanager
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-MODEL_ID = "google/gemma-2-2b-it"
-DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
+# Pick a model with STEER_MODEL=<name>, e.g. `export STEER_MODEL=qwen3-14b`.
+MODELS = {
+    # Gemma 2 recommends eager attention (attention logit soft-capping).
+    "gemma-2-2b": {"id": "google/gemma-2-2b-it", "load": {"attn_implementation": "eager"}},
+    # 14B in bf16 is ~28 GB, so load it in 4-bit (~10 GB) to fit a 16 GB GPU. Replies skip
+    # Qwen's <think> block so the steered text is the answer itself.
+    "qwen3-14b": {"id": "Qwen/Qwen3-14B", "quantize_4bit": True, "chat": {"enable_thinking": False}},
+}
+MODEL_NAME = os.environ.get("STEER_MODEL", "gemma-2-2b")
+if MODEL_NAME not in MODELS:
+    raise SystemExit(f"Unknown STEER_MODEL={MODEL_NAME!r}; choose from {', '.join(MODELS)}")
+MODEL = MODELS[MODEL_NAME]
+MODEL_ID = MODEL["id"]
+
+if os.environ.get("STEER_DEVICE"):  # e.g. `export STEER_DEVICE=cpu` to leave the GPU alone
+    DEVICE = os.environ["STEER_DEVICE"]
+elif torch.cuda.is_available():
+    DEVICE = "cuda"
+elif torch.backends.mps.is_available():
+    DEVICE = "mps"
+else:
+    DEVICE = "cpu"
 HERE = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(HERE, "cache")
-VECTORS_PATH = os.path.join(HERE, "vectors.pt")
+VECTORS_PATH = os.path.join(HERE, "vectors", f"{MODEL_NAME}.pt")
 
 
 def load_model():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
     tokenizer.padding_side = "left"  # so position -1 is always the last real token
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID, dtype=torch.bfloat16, attn_implementation="eager"
-    ).to(DEVICE)
+    kwargs = dict(MODEL.get("load", {}))
+    if MODEL.get("quantize_4bit"):
+        from transformers import BitsAndBytesConfig
+
+        kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.bfloat16
+        )
+        kwargs["device_map"] = DEVICE  # quantized weights are placed while loading, not moved after
+    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype=torch.bfloat16, **kwargs)
+    if not MODEL.get("quantize_4bit"):
+        model = model.to(DEVICE)
     model.eval()
     return model, tokenizer
 
@@ -70,7 +98,7 @@ def steering(model, layer, vector):
 def chat(model, tokenizer, prompt, max_new_tokens=80):
     inputs = tokenizer.apply_chat_template(
         [{"role": "user", "content": prompt}],
-        add_generation_prompt=True, return_tensors="pt", return_dict=True,
+        add_generation_prompt=True, return_tensors="pt", return_dict=True, **MODEL.get("chat", {}),
     ).to(DEVICE)
     out = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
     return tokenizer.decode(out[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
